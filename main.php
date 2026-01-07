@@ -59,29 +59,30 @@ class MinHeap {
         }
         
         $removed = $this->heap[$index];
-        $removed->index = -1;
         
-        $this->size--;
-        if ($index === $this->size) {
+        $lastIndex = $this->size - 1;
+        if ($index === $lastIndex) {
+            $this->size--;
             unset($this->heap[$this->size]);
+            $removed->index = -1;
             return $removed;
         }
         
-        $this->heap[$index] = $this->heap[$this->size];
-        $this->heap[$index]->index = $index;
+        $this->swap($index, $lastIndex);
+        $this->size--;
         unset($this->heap[$this->size]);
+        $removed->index = -1;
         
-        $parentIndex = intdiv($index - 1, 2);
-        if ($index > 0 && $this->heap[$index]->expiration < $this->heap[$parentIndex]->expiration) {
-            $this->siftUp($index);
-        } else {
-            $this->siftDown($index);
-        }
+        $this->fix($index);
         
         return $removed;
     }
 
     public function fix($index) {
+        if ($index >= $this->size) {
+            return;
+        }
+        
         $parentIndex = intdiv($index - 1, 2);
         if ($index > 0 && $this->heap[$index]->expiration < $this->heap[$parentIndex]->expiration) {
             $this->siftUp($index);
@@ -108,7 +109,7 @@ class MinHeap {
     }
 
     private function siftDown($index) {
-        while (true) {
+        while ($index < $this->size) {
             $leftChild = 2 * $index + 1;
             $rightChild = 2 * $index + 2;
             $smallest = $index;
@@ -188,7 +189,7 @@ class OptimizedTTLCache {
         $this->useLocking = $useLocking;
         
         if ($this->useLocking) {
-            $this->lockFile = sys_get_temp_dir() . '/ttl_cache_' . uniqid() . '.lock';
+            $this->lockFile = sys_get_temp_dir() . '/ttl_cache.lock';
         }
         
         register_shutdown_function([$this, 'stop']);
@@ -196,23 +197,23 @@ class OptimizedTTLCache {
 
     private function lock() {
         if (!$this->useLocking) {
-            return;
+            return null;
         }
         
         $lock = fopen($this->lockFile, 'w');
-        flock($lock, LOCK_EX);
+        if ($lock) {
+            flock($lock, LOCK_EX);
+        }
         return $lock;
     }
 
     private function unlock($lock) {
-        if (!$this->useLocking) {
+        if (!$this->useLocking || !$lock) {
             return;
         }
         
-        if ($lock) {
-            flock($lock, LOCK_UN);
-            fclose($lock);
-        }
+        flock($lock, LOCK_UN);
+        fclose($lock);
     }
 
     public function set($key, $value) {
@@ -259,12 +260,10 @@ class OptimizedTTLCache {
         }
         
         $heapItem = $this->expiryHeap->pop();
-        if ($heapItem->index !== -1) {
-            return;
+        if ($heapItem && isset($this->items[$heapItem->key])) {
+            unset($this->items[$heapItem->key]);
+            $this->stats->evictions++;
         }
-        
-        unset($this->items[$heapItem->key]);
-        $this->stats->evictions++;
     }
 
     public function get($key) {
@@ -310,11 +309,15 @@ class OptimizedTTLCache {
         
         while ($this->expiryHeap->count() > 0) {
             $heapItem = $this->expiryHeap->peek();
-            if (!$heapItem || $now <= $heapItem->expiration) {
+            if (!$heapItem) {
                 break;
             }
             
-            $this->expiryHeap->pop();
+            if ($now <= $heapItem->expiration) {
+                break;
+            }
+            
+            $heapItem = $this->expiryHeap->pop();
             if (isset($this->items[$heapItem->key])) {
                 unset($this->items[$heapItem->key]);
                 $count++;
@@ -338,10 +341,6 @@ class OptimizedTTLCache {
             $this->running = false;
             $this->cleanupExpired();
             $this->unlock($lock);
-            
-            if ($this->useLocking && file_exists($this->lockFile)) {
-                unlink($this->lockFile);
-            }
         }
     }
 
@@ -428,6 +427,8 @@ class OptimizedTTLCache {
         $now = microtime(true);
         
         if ($now > $item->heapItem->expiration) {
+            $this->expiryHeap->removeAt($item->heapItem->index);
+            unset($this->items[$key]);
             $this->stats->misses++;
             $this->stats->expirations++;
             $this->unlock($lock);
@@ -479,17 +480,20 @@ class OptimizedTTLCache {
         $lock = $this->lock();
         
         $valid = true;
+        $heapSize = $this->expiryHeap->count();
         
-        $heapReflection = new ReflectionClass($this->expiryHeap);
-        $heapProperty = $heapReflection->getProperty('heap');
-        $heapProperty->setAccessible(true);
-        $heapArray = $heapProperty->getValue($this->expiryHeap);
-        
-        foreach ($heapArray as $index => $item) {
-            if ($item->index !== $index) {
+        for ($i = 0; $i < $heapSize; $i++) {
+            $item = $this->expiryHeap->peek();
+            if (!$item) {
                 $valid = false;
                 break;
             }
+            
+            if ($item->index !== $i) {
+                $valid = false;
+                break;
+            }
+            
             if (!isset($this->items[$item->key])) {
                 $valid = false;
                 break;
@@ -501,10 +505,7 @@ class OptimizedTTLCache {
     }
 
     public function capacity() {
-        $lock = $this->lock();
-        $capacity = $this->capacity;
-        $this->unlock($lock);
-        return $capacity;
+        return $this->capacity;
     }
 
     public function __destruct() {
