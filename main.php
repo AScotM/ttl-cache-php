@@ -170,6 +170,8 @@ class OptimizedTTLCache {
     private $stats;
     private $cleanupInterval = 1;
     private $lastCleanupTime = 0;
+    private $cleanupCounter = 0;
+    private $cleanupThreshold = 100;
     private $running = true;
     private $lockFile;
     private $useLocking;
@@ -189,7 +191,7 @@ class OptimizedTTLCache {
         $this->useLocking = $useLocking;
         
         if ($this->useLocking) {
-            $this->lockFile = sys_get_temp_dir() . '/ttl_cache.lock';
+            $this->lockFile = sys_get_temp_dir() . '/ttl_cache_' . uniqid('', true) . '.lock';
         }
         
         register_shutdown_function([$this, 'stop']);
@@ -200,10 +202,18 @@ class OptimizedTTLCache {
             return null;
         }
         
-        $lock = fopen($this->lockFile, 'w');
-        if ($lock) {
-            flock($lock, LOCK_EX);
+        $lock = @fopen($this->lockFile, 'w+');
+        if ($lock === false) {
+            error_log("TTLCache: Failed to open lock file: " . $this->lockFile);
+            return null;
         }
+        
+        if (!flock($lock, LOCK_EX)) {
+            fclose($lock);
+            error_log("TTLCache: Failed to acquire lock on file: " . $this->lockFile);
+            return null;
+        }
+        
         return $lock;
     }
 
@@ -296,10 +306,14 @@ class OptimizedTTLCache {
     }
 
     private function performCleanupIfNeeded() {
-        $now = microtime(true);
-        if ($now - $this->lastCleanupTime >= $this->cleanupInterval) {
-            $this->cleanupExpired();
-            $this->lastCleanupTime = $now;
+        $this->cleanupCounter++;
+        if ($this->cleanupCounter >= $this->cleanupThreshold) {
+            $now = microtime(true);
+            if ($now - $this->lastCleanupTime >= $this->cleanupInterval) {
+                $this->cleanupExpired();
+                $this->lastCleanupTime = $now;
+            }
+            $this->cleanupCounter = 0;
         }
     }
 
@@ -307,7 +321,7 @@ class OptimizedTTLCache {
         $count = 0;
         $now = microtime(true);
         
-        while ($this->expiryHeap->count() > 0) {
+        while (true) {
             $heapItem = $this->expiryHeap->peek();
             if (!$heapItem) {
                 break;
@@ -317,9 +331,9 @@ class OptimizedTTLCache {
                 break;
             }
             
-            $heapItem = $this->expiryHeap->pop();
-            if (isset($this->items[$heapItem->key])) {
-                unset($this->items[$heapItem->key]);
+            $removed = $this->expiryHeap->removeAt(0);
+            if ($removed && isset($this->items[$removed->key])) {
+                unset($this->items[$removed->key]);
                 $count++;
             }
         }
